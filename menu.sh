@@ -140,7 +140,7 @@ check_and_show_status() {
         if [ -d "/etc/snell/users" ]; then
             for user_conf in "/etc/snell/users"/*; do
                 if [ -f "$user_conf" ] && [[ "$user_conf" != *"snell-main.conf" ]]; then
-                    local port=$(grep -E '^listen' "$user_conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+                    local port=$(grep -E '^listen' "$user_conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
                     if [ ! -z "$port" ]; then
                         user_count=$((user_count + 1))
                         if systemctl is-active --quiet "snell-${port}"; then
@@ -301,37 +301,132 @@ manage_vless() {
     # 从你的仓库拉取并执行 vless 管理脚本
     bash <(curl -sL https://raw.githubusercontent.com/jinqians/vless/refs/heads/main/vless.sh)
 }
+
+save_nftables_rules() {
+    if ! command -v nft >/dev/null 2>&1; then
+        return
+    fi
+
+    if [ -f "/etc/nftables.conf" ]; then
+        nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+        systemctl enable nftables >/dev/null 2>&1 || true
+    elif [ -f "/etc/sysconfig/nftables.conf" ]; then
+        nft list ruleset > /etc/sysconfig/nftables.conf 2>/dev/null || true
+        systemctl enable nftables >/dev/null 2>&1 || true
+    fi
+}
+
+close_nftables_port() {
+    local port=$1
+
+    if ! command -v nft >/dev/null 2>&1; then
+        return
+    fi
+
+    nft -a list ruleset 2>/dev/null | awk -v port="$port" '
+        $1 == "table" {
+            family=$2
+            table=$3
+            gsub(/[{}]/, "", table)
+        }
+        $1 == "chain" {
+            chain=$2
+            gsub(/[{}]/, "", chain)
+        }
+        ($0 ~ "tcp dport " port " .*accept" || $0 ~ "udp dport " port " .*accept") && /# handle/ {
+            handle=$NF
+            print family " " table " " chain " " handle
+        }
+    ' | while read -r family table chain handle; do
+        [ -z "$handle" ] && continue
+        nft delete rule "$family" "$table" "$chain" handle "$handle" 2>/dev/null || true
+    done
+
+    save_nftables_rules
+}
+
+close_port() {
+    local port=$1
+
+    if command -v ufw >/dev/null 2>&1; then
+        ufw delete allow "$port"/tcp >/dev/null 2>&1 || true
+        ufw delete allow "$port"/udp >/dev/null 2>&1 || true
+    fi
+
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        if [ -d "/etc/iptables" ]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+    fi
+
+    close_nftables_port "$port"
+}
+
 # 卸载 Snell
 uninstall_snell() {
     echo -e "${CYAN}正在卸载 Snell${RESET}"
 
+    # 停止并删除依赖 Snell 后端的 ShadowTLS 服务，避免留下无后端的监听服务
+    local snell_shadowtls_services
+    snell_shadowtls_services=$(find "${SYSTEMD_DIR}" -maxdepth 1 -name "shadowtls-snell-*.service" 2>/dev/null)
+    if [ -n "$snell_shadowtls_services" ]; then
+        while IFS= read -r service_file; do
+            [ -z "$service_file" ] && continue
+            local service_name
+            service_name=$(basename "$service_file")
+            local shadowtls_port
+            shadowtls_port=$(sed -n 's/.*--listen .*:\([0-9][0-9]*\).*/\1/p' "$service_file" | head -n 1)
+            echo -e "${YELLOW}正在停止 ShadowTLS 服务 (${service_name})${RESET}"
+            systemctl stop "$service_name" 2>/dev/null
+            systemctl disable "$service_name" 2>/dev/null
+            rm -f "$service_file"
+            if [ -n "$shadowtls_port" ]; then
+                close_port "$shadowtls_port"
+            fi
+        done <<< "$snell_shadowtls_services"
+    fi
+
     # 停止并禁用主服务
-    systemctl stop snell
-    systemctl disable snell
+    systemctl stop snell 2>/dev/null
+    systemctl disable snell 2>/dev/null
+    systemctl stop snell.socket 2>/dev/null
+    systemctl disable snell.socket 2>/dev/null
+    systemctl stop snell-netns 2>/dev/null
+    systemctl disable snell-netns 2>/dev/null
 
     # 停止并禁用所有多用户服务
     if [ -d "/etc/snell/users" ]; then
         for user_conf in "/etc/snell/users"/*; do
             if [ -f "$user_conf" ]; then
-                local port=$(grep -E '^listen' "$user_conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+                local port=$(grep -E '^listen' "$user_conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
                 if [ ! -z "$port" ]; then
                     echo -e "${YELLOW}正在停止用户服务 (端口: $port)${RESET}"
                     systemctl stop "snell-${port}" 2>/dev/null
                     systemctl disable "snell-${port}" 2>/dev/null
                     rm -f "${SYSTEMD_DIR}/snell-${port}.service"
+                    close_port "$port"
                 fi
             fi
         done
     fi
 
     # 删除服务文件
-    rm -f "/lib/systemd/system/${service_name}.service"
+    rm -f "/lib/systemd/system/snell.service"
     rm -f "${SYSTEMD_DIR}/snell.service"
+    rm -f "${SYSTEMD_DIR}/snell.socket"
+    rm -f "${SYSTEMD_DIR}/snell-netns.service"
+    rm -f "/usr/local/bin/snell-netns-setup.sh"
 
     # 删除可执行文件和配置目录
     rm -f /usr/local/bin/snell-server
     rm -rf /etc/snell
     rm -f /usr/local/bin/snell  # 删除管理脚本
+
+    if ! find "${SYSTEMD_DIR}" -maxdepth 1 -name "shadowtls-*.service" 2>/dev/null | grep -q .; then
+        rm -f /usr/local/bin/shadow-tls
+    fi
     
     # 重载 systemd 配置
     systemctl daemon-reload
@@ -364,9 +459,18 @@ uninstall_shadowtls() {
     
     # 停止并禁用所有 ShadowTLS 服务
     while IFS= read -r service; do
+        [ -z "$service" ] && continue
+        local service_file="/etc/systemd/system/${service}"
+        local listen_port=""
+        if [ -f "$service_file" ]; then
+            listen_port=$(sed -n 's/.*--listen .*:\([0-9][0-9]*\).*/\1/p' "$service_file" | head -n 1)
+        fi
         systemctl stop "$service" 2>/dev/null
         systemctl disable "$service" 2>/dev/null
-        rm -f "/etc/systemd/system/${service}"
+        rm -f "$service_file"
+        if [ -n "$listen_port" ]; then
+            close_port "$listen_port"
+        fi
     done < <(systemctl list-units --type=service --all --no-legend | grep "shadowtls-" | awk '{print $1}')
     
     # 删除二进制文件
@@ -409,7 +513,7 @@ show_menu() {
     
     echo -e "${CYAN}============================================${RESET}"
 
-    echo -e "${GREEN}退出脚本后，输入menu可进入脚本{RESET}"
+    echo -e "${GREEN}退出脚本后，输入menu可进入脚本${RESET}"
 
     echo -e "${CYAN}============================================${RESET}"
     read -rp "请输入选项 [0-8]: " num

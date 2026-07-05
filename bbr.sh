@@ -157,7 +157,11 @@ main_menu() {
         echo -e "${YELLOW}3. 安装 BBR v3 (手动编译)${RESET}"
         echo -e "${YELLOW}4. 返回上级菜单${RESET}"
         echo -e "${YELLOW}5. 退出脚本${RESET}"
-        read -p "请选择操作 [1-5]: " choice
+        if ! read -rp "请选择操作 [1-5]: " choice; then
+            echo
+            echo -e "${YELLOW}未读取到输入，已退出 BBR 菜单。${RESET}"
+            return 0
+        fi
 
         case "$choice" in
             1)

@@ -22,7 +22,10 @@ SERVICE_FILE="${SYSTEMD_DIR}/shadowtls.service"
 # 定义配置目录
 SNELL_CONF_DIR="/etc/snell"
 SNELL_CONF_FILE="${SNELL_CONF_DIR}/users/snell-main.conf"
+OLD_SNELL_CONF_FILE="${SNELL_CONF_DIR}/snell-server.conf"
 USERS_DIR="${SNELL_CONF_DIR}/users"
+SNELL_SERVICE_USER="snell"
+SNELL_SERVICE_GROUP="snell"
 
 # 检查是否以 root 权限运行
 check_root() {
@@ -77,6 +80,213 @@ check_snell() {
     return 0
 }
 
+save_nftables_rules() {
+    if ! command -v nft >/dev/null 2>&1; then
+        return
+    fi
+
+    if [ -f "/etc/nftables.conf" ]; then
+        nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+        systemctl enable nftables >/dev/null 2>&1 || true
+        echo -e "${GREEN}nftables 规则已保存${RESET}"
+    elif [ -f "/etc/sysconfig/nftables.conf" ]; then
+        nft list ruleset > /etc/sysconfig/nftables.conf 2>/dev/null || true
+        systemctl enable nftables >/dev/null 2>&1 || true
+        echo -e "${GREEN}nftables 规则已保存${RESET}"
+    else
+        echo -e "${YELLOW}未找到 nftables 持久化配置文件，端口规则已在当前运行环境生效${RESET}"
+    fi
+}
+
+open_nftables_port() {
+    local port=$1
+    local chains
+    local chain_opened=false
+
+    if ! command -v nft >/dev/null 2>&1; then
+        return
+    fi
+
+    echo -e "${CYAN}在 nftables 中开放端口 ${port}${RESET}"
+
+    chains=$(nft -a list ruleset 2>/dev/null | awk '
+        $1 == "table" {
+            family=$2
+            table=$3
+            gsub(/[{}]/, "", table)
+        }
+        $1 == "chain" {
+            chain=$2
+            gsub(/[{}]/, "", chain)
+            in_chain=1
+            next
+        }
+        in_chain && /type filter/ && /hook input/ {
+            print family " " table " " chain
+        }
+        in_chain && /^[[:space:]]*}/ {
+            in_chain=0
+        }
+    ')
+
+    while read -r family table chain; do
+        [ -z "$family" ] && continue
+
+        if ! nft list chain "$family" "$table" "$chain" 2>/dev/null | grep -q "tcp dport ${port} .*accept"; then
+            nft insert rule "$family" "$table" "$chain" tcp dport "$port" accept 2>/dev/null || true
+        fi
+        chain_opened=true
+    done << EOF
+$chains
+EOF
+
+    if [ "$chain_opened" = false ]; then
+        nft add table inet shadowtls_filter 2>/dev/null || true
+        nft list chain inet shadowtls_filter input >/dev/null 2>&1 || nft add chain inet shadowtls_filter input '{ type filter hook input priority -5; policy accept; }'
+        if ! nft list chain inet shadowtls_filter input 2>/dev/null | grep -q "tcp dport ${port} .*accept"; then
+            nft add rule inet shadowtls_filter input tcp dport "$port" accept 2>/dev/null || true
+        fi
+    fi
+
+    save_nftables_rules
+}
+
+open_port() {
+    local port=$1
+    local ufw_active=false
+
+    if command -v ufw >/dev/null 2>&1; then
+        echo -e "${CYAN}在 UFW 中开放端口 ${port}${RESET}"
+        ufw allow "${port}"/tcp
+        if ufw status 2>/dev/null | grep -qw "active"; then
+            ufw_active=true
+        fi
+    fi
+
+    if command -v iptables >/dev/null 2>&1; then
+        echo -e "${CYAN}在 iptables 中开放端口 ${port}${RESET}"
+        iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4 || true
+    fi
+
+    if [ "$ufw_active" = false ]; then
+        open_nftables_port "$port"
+    fi
+}
+
+close_nftables_port() {
+    local port=$1
+
+    if ! command -v nft >/dev/null 2>&1; then
+        return
+    fi
+
+    nft -a list ruleset 2>/dev/null | awk -v port="$port" '
+        $1 == "table" {
+            family=$2
+            table=$3
+            gsub(/[{}]/, "", table)
+        }
+        $1 == "chain" {
+            chain=$2
+            gsub(/[{}]/, "", chain)
+        }
+        $0 ~ "tcp dport " port " .*accept" && /# handle/ {
+            handle=$NF
+            print family " " table " " chain " " handle
+        }
+    ' | while read -r family table chain handle; do
+        [ -z "$handle" ] && continue
+        nft delete rule "$family" "$table" "$chain" handle "$handle" 2>/dev/null || true
+    done
+
+    save_nftables_rules
+}
+
+close_port() {
+    local port=$1
+
+    if command -v ufw >/dev/null 2>&1; then
+        ufw delete allow "$port"/tcp >/dev/null 2>&1 || true
+    fi
+
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+        if [ -d "/etc/iptables" ]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+    fi
+
+    close_nftables_port "$port"
+}
+
+ensure_snell_service_user() {
+    if ! getent group "${SNELL_SERVICE_GROUP}" >/dev/null 2>&1; then
+        groupadd --system "${SNELL_SERVICE_GROUP}" 2>/dev/null || true
+    fi
+
+    if ! getent passwd "${SNELL_SERVICE_USER}" >/dev/null 2>&1; then
+        useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --gid "${SNELL_SERVICE_GROUP}" "${SNELL_SERVICE_USER}" 2>/dev/null || \
+        useradd -r -M -s /usr/sbin/nologin -g "${SNELL_SERVICE_GROUP}" "${SNELL_SERVICE_USER}" 2>/dev/null || true
+    fi
+}
+
+ensure_snell_config_dir() {
+    ensure_snell_service_user
+    mkdir -p "${USERS_DIR}"
+    if getent group "${SNELL_SERVICE_GROUP}" >/dev/null 2>&1 && getent passwd "${SNELL_SERVICE_USER}" >/dev/null 2>&1; then
+        chown -R "${SNELL_SERVICE_USER}:${SNELL_SERVICE_GROUP}" "${SNELL_CONF_DIR}" 2>/dev/null || true
+    fi
+    chmod 755 "${SNELL_CONF_DIR}" "${USERS_DIR}" 2>/dev/null || true
+}
+
+migrate_legacy_snell_config() {
+    ensure_snell_config_dir
+
+    if [ -f "${SNELL_CONF_FILE}" ]; then
+        return 0
+    fi
+
+    if [ -f "${OLD_SNELL_CONF_FILE}" ]; then
+        cp -a "${OLD_SNELL_CONF_FILE}" "${SNELL_CONF_FILE}"
+        if getent group "${SNELL_SERVICE_GROUP}" >/dev/null 2>&1 && getent passwd "${SNELL_SERVICE_USER}" >/dev/null 2>&1; then
+            chown "${SNELL_SERVICE_USER}:${SNELL_SERVICE_GROUP}" "${SNELL_CONF_FILE}" 2>/dev/null || true
+        fi
+        chmod 644 "${SNELL_CONF_FILE}"
+        echo -e "${GREEN}已将旧 Snell 配置迁移到 ${SNELL_CONF_FILE}${RESET}"
+        return 0
+    fi
+
+    return 1
+}
+
+check_snell_config() {
+    if ! check_snell; then
+        return 1
+    fi
+
+    migrate_legacy_snell_config || true
+
+    if [ ! -s "${SNELL_CONF_FILE}" ]; then
+        echo -e "${RED}Snell 主配置不存在: ${SNELL_CONF_FILE}${RESET}"
+        echo -e "${YELLOW}请先运行 Snell 安装/修复，或将旧配置 ${OLD_SNELL_CONF_FILE} 迁移到 users 目录。${RESET}"
+        return 1
+    fi
+
+    if ! grep -Eq '^[[:space:]]*listen[[:space:]]*=' "${SNELL_CONF_FILE}"; then
+        echo -e "${RED}Snell 主配置缺少 listen: ${SNELL_CONF_FILE}${RESET}"
+        return 1
+    fi
+
+    if ! grep -Eq '^[[:space:]]*psk[[:space:]]*=' "${SNELL_CONF_FILE}"; then
+        echo -e "${RED}Snell 主配置缺少 psk: ${SNELL_CONF_FILE}${RESET}"
+        return 1
+    fi
+
+    return 0
+}
+
 # 获取 SS 端口
 get_ssrust_port() {
     local ssrust_conf="/etc/ss-rust/config.json"
@@ -109,14 +319,16 @@ get_ssrust_method() {
 
 # 获取 Snell 端口
 get_snell_port() {
+    migrate_legacy_snell_config >/dev/null 2>&1 || true
     if [ -f "${SNELL_CONF_FILE}" ]; then
-        grep -E '^listen' "${SNELL_CONF_FILE}" | sed -n 's/.*::0:\([0-9]*\)/\1/p'
+        grep -E '^listen' "${SNELL_CONF_FILE}" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p'
     fi
 }
 
 # 获取 Snell PSK
 get_snell_psk() {
-    local snell_conf="/etc/snell/users/snell-main.conf"
+    local snell_conf="${SNELL_CONF_FILE}"
+    migrate_legacy_snell_config >/dev/null 2>&1 || true
     if [ ! -f "$snell_conf" ]; then
         return 1
     fi
@@ -129,14 +341,25 @@ get_snell_config() {
     local port=$1
     local snell_conf="${USERS_DIR}/snell-${port}.conf"
     local main_conf="${USERS_DIR}/snell-main.conf"
+    local psk=""
     
-    # 尝试获取指定端口的配置，如果不存在则使用主配置
-    local psk=$(grep -E "^psk = " "$snell_conf" 2>/dev/null | sed 's/psk = //' || grep -E "^psk = " "$main_conf" 2>/dev/null | sed 's/psk = //')
+    migrate_legacy_snell_config >/dev/null 2>&1 || true
+
+    if [ -f "$snell_conf" ]; then
+        psk=$(grep -E "^psk[[:space:]]*=" "$snell_conf" 2>/dev/null | head -n 1 | sed 's/^[^=]*=[[:space:]]*//')
+    fi
+
+    if [ -z "$psk" ] && [ -f "$main_conf" ]; then
+        psk=$(grep -E "^psk[[:space:]]*=" "$main_conf" 2>/dev/null | head -n 1 | sed 's/^[^=]*=[[:space:]]*//')
+    fi
+
     echo "$psk"
 }
 
 # 获取所有 Snell 用户配置
 get_all_snell_users() {
+    migrate_legacy_snell_config >/dev/null 2>&1 || true
+
     # 检查用户配置目录是否存在
     if [ ! -d "${USERS_DIR}" ]; then
         return 1
@@ -146,7 +369,7 @@ get_all_snell_users() {
     local main_port=""
     local main_psk=""
     if [ -f "${SNELL_CONF_FILE}" ]; then
-        main_port=$(grep -E '^listen' "${SNELL_CONF_FILE}" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+        main_port=$(grep -E '^listen' "${SNELL_CONF_FILE}" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
         main_psk=$(grep -E '^psk' "${SNELL_CONF_FILE}" | awk -F'=' '{print $2}' | tr -d ' ')
         if [ ! -z "$main_port" ] && [ ! -z "$main_psk" ]; then
             echo "${main_port}|${main_psk}"
@@ -156,7 +379,7 @@ get_all_snell_users() {
     # 获取其他用户配置
     for user_conf in "${USERS_DIR}"/snell-*.conf; do
         if [ -f "$user_conf" ] && [[ "$user_conf" != *"snell-main.conf" ]]; then
-            local port=$(grep -E '^listen' "$user_conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+            local port=$(grep -E '^listen' "$user_conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
             local psk=$(grep -E '^psk' "$user_conf" | awk -F'=' '{print $2}' | tr -d ' ')
             if [ ! -z "$port" ] && [ ! -z "$psk" ]; then
                 echo "${port}|${psk}"
@@ -237,9 +460,17 @@ generate_random_port() {
 # 检查端口是否被占用
 check_port_usage() {
     local port=$1
-    if netstat -tuln | grep -q ":${port}"; then
-        return 0  # 端口被占用
+
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tuln | grep -q ":${port}\b"; then
+            return 0  # 端口被占用
+        fi
+    elif command -v netstat >/dev/null 2>&1; then
+        if netstat -tuln | grep -q ":${port}\b"; then
+            return 0  # 端口被占用
+        fi
     fi
+
     return 1     # 端口未被占用
 }
 
@@ -472,7 +703,7 @@ CPUAffinity=0
 Nice=0
 IOSchedulingClass=realtime
 IOSchedulingPriority=0
-MemoryLimit=512M
+MemoryMax=512M
 CPUQuota=50%
 LimitCORE=infinity
 LimitRSS=infinity
@@ -506,6 +737,8 @@ EOF
 # 安装 ShadowTLS
 install_shadowtls() {
     echo -e "${CYAN}正在安装 ShadowTLS...${RESET}"
+
+    install_requirements
     
     # 检测已安装的协议
     local has_ss=false
@@ -516,9 +749,11 @@ install_shadowtls() {
         echo -e "${GREEN}检测到已安装 Shadowsocks Rust${RESET}"
     fi
     
-    if check_snell; then
+    if check_snell_config; then
         has_snell=true
         echo -e "${GREEN}检测到已安装 Snell${RESET}"
+    elif check_snell; then
+        echo -e "${YELLOW}检测到 Snell 二进制，但主配置不可用，暂不能为 Snell 配置 ShadowTLS${RESET}"
     fi
     
     if ! $has_ss && ! $has_snell; then
@@ -654,6 +889,7 @@ install_shadowtls() {
         # 创建 SS 的 ShadowTLS 服务
         local ss_port=$(get_ssrust_port)
         create_shadowtls_service "ss" "$ss_port" "$ss_listen_port" "$tls_domain" "$password"
+        open_port "$ss_listen_port"
         systemctl start shadowtls-ss
         systemctl enable shadowtls-ss
     fi
@@ -709,6 +945,7 @@ install_shadowtls() {
                 
                 # 创建服务文件
                 create_shadowtls_service "snell" "$port" "$stls_port" "$tls_domain" "$password"
+                open_port "$stls_port"
                 systemctl start "shadowtls-snell-${port}"
                 systemctl enable "shadowtls-snell-${port}"
             done
@@ -731,6 +968,7 @@ install_shadowtls() {
             
             # 创建服务文件
             create_shadowtls_service "snell" "$selected_port" "$stls_port" "$tls_domain" "$password"
+            open_port "$stls_port"
             systemctl start "shadowtls-snell-${selected_port}"
             systemctl enable "shadowtls-snell-${selected_port}"
         else
@@ -776,9 +1014,14 @@ uninstall_shadowtls() {
     
     # 停止并禁用 SS 服务
     if [ -f "${SYSTEMD_DIR}/shadowtls-ss.service" ]; then
+        local ss_listen_port
+        ss_listen_port=$(sed -n 's/.*--listen .*:\([0-9][0-9]*\).*/\1/p' "${SYSTEMD_DIR}/shadowtls-ss.service" | head -n 1)
         systemctl stop shadowtls-ss 2>/dev/null
         systemctl disable shadowtls-ss 2>/dev/null
         rm -f "${SYSTEMD_DIR}/shadowtls-ss.service"
+        if [ -n "$ss_listen_port" ]; then
+            close_port "$ss_listen_port"
+        fi
     fi
     
     # 停止并禁用所有 Snell 相关的 ShadowTLS 服务
@@ -786,9 +1029,14 @@ uninstall_shadowtls() {
     if [ ! -z "$snell_services" ]; then
         while IFS= read -r service_file; do
             local service_name=$(basename "$service_file")
+            local listen_port
+            listen_port=$(sed -n 's/.*--listen .*:\([0-9][0-9]*\).*/\1/p' "$service_file" | head -n 1)
             systemctl stop "$service_name" 2>/dev/null
             systemctl disable "$service_name" 2>/dev/null
             rm -f "$service_file"
+            if [ -n "$listen_port" ]; then
+                close_port "$listen_port"
+            fi
         done <<< "$snell_services"
     fi
     
@@ -966,9 +1214,11 @@ add_shadowtls_config() {
         fi
     fi
     
-    if check_snell; then
+    if check_snell_config; then
         has_snell=true
         echo -e "${GREEN}检测到已安装 Snell${RESET}"
+    elif check_snell; then
+        echo -e "${YELLOW}检测到 Snell 二进制，但主配置不可用，暂不能为 Snell 新增 ShadowTLS 配置${RESET}"
     fi
     
     if ! $has_ss && ! $has_snell; then
@@ -1020,6 +1270,7 @@ add_shadowtls_config() {
                 # 创建 SS 的 ShadowTLS 服务
                 local ss_port=$(get_ssrust_port)
                 create_shadowtls_service "ss" "$ss_port" "$ss_listen_port" "$tls_domain" "$password"
+                open_port "$ss_listen_port"
                 systemctl start shadowtls-ss
                 systemctl enable shadowtls-ss
                 
@@ -1094,12 +1345,13 @@ add_shadowtls_config() {
                         
                         # 创建服务文件
                         create_shadowtls_service "snell" "$port" "$stls_port" "$tls_domain" "$password"
+                        open_port "$stls_port"
                         systemctl start "shadowtls-snell-${port}"
                         systemctl enable "shadowtls-snell-${port}"
                         
                         # 显示配置信息
                         local server_ip=$(get_server_ip)
-                        local psk=$(grep -E "^psk = " "/etc/snell/users/snell-${port}.conf" 2>/dev/null | sed 's/psk = //' || grep -E "^psk = " "/etc/snell/users/snell-main.conf" 2>/dev/null | sed 's/psk = //')
+                        local psk=$(get_snell_config "$port")
                         generate_snell_links "${server_ip}" "${stls_port}" "${psk}" "${password}" "${tls_domain}" "${port}"
                     done
                 elif [[ "$port_choice" =~ ^[0-9]+$ ]] && [ "$port_choice" -ge 1 ] && [ "$port_choice" -le ${#port_list[@]} ]; then
@@ -1119,12 +1371,13 @@ add_shadowtls_config() {
                     
                     # 创建服务文件
                     create_shadowtls_service "snell" "$selected_port" "$stls_port" "$tls_domain" "$password"
+                    open_port "$stls_port"
                     systemctl start "shadowtls-snell-${selected_port}"
                     systemctl enable "shadowtls-snell-${selected_port}"
                     
                     # 显示配置信息
                     local server_ip=$(get_server_ip)
-                    local psk=$(grep -E "^psk = " "/etc/snell/users/snell-${selected_port}.conf" 2>/dev/null | sed 's/psk = //' || grep -E "^psk = " "/etc/snell/users/snell-main.conf" 2>/dev/null | sed 's/psk = //')
+                    local psk=$(get_snell_config "$selected_port")
                     generate_snell_links "${server_ip}" "${stls_port}" "${psk}" "${password}" "${tls_domain}" "${selected_port}"
                 else
                     echo -e "${RED}无效的选择${RESET}"
@@ -1213,7 +1466,11 @@ main_menu() {
         echo -e "${YELLOW}6. 返回上级菜单${RESET}"
         echo -e "${YELLOW}0. 退出${RESET}"
         
-        read -rp "请选择操作 [0-6]: " choice
+        if ! read -rp "请选择操作 [0-6]: " choice; then
+            echo
+            echo -e "${YELLOW}未读取到输入，已退出 ShadowTLS 菜单。${RESET}"
+            return 0
+        fi
         
         case "$choice" in
             1)

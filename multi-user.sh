@@ -20,6 +20,19 @@ SNELL_CONF_FILE="${SNELL_CONF_DIR}/users/snell-main.conf"
 # 定义目录和文件路径
 INSTALL_DIR="/usr/local/bin"
 SYSTEMD_DIR="/etc/systemd/system"
+SNELL_SERVICE_USER="snell"
+SNELL_SERVICE_GROUP="snell"
+
+ensure_snell_service_user() {
+    if ! getent group "${SNELL_SERVICE_GROUP}" >/dev/null 2>&1; then
+        groupadd --system "${SNELL_SERVICE_GROUP}" 2>/dev/null || true
+    fi
+
+    if ! getent passwd "${SNELL_SERVICE_USER}" >/dev/null 2>&1; then
+        useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --gid "${SNELL_SERVICE_GROUP}" "${SNELL_SERVICE_USER}" 2>/dev/null || \
+        useradd -r -M -s /usr/sbin/nologin -g "${SNELL_SERVICE_GROUP}" "${SNELL_SERVICE_USER}" 2>/dev/null || true
+    fi
+}
 
 # 检查是否以 root 权限运行
 check_root() {
@@ -181,7 +194,7 @@ open_port() {
 # 获取主用户端口
 get_main_port() {
     if [ -f "${SNELL_CONF_FILE}" ]; then
-        local main_port=$(grep -E '^listen' "${SNELL_CONF_FILE}" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+        local main_port=$(grep -E '^listen' "${SNELL_CONF_FILE}" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
         echo "$main_port"
     fi
 }
@@ -196,7 +209,7 @@ get_all_ports() {
     # 获取所有配置文件中的端口
     for conf_file in "${SNELL_CONF_DIR}/users"/snell-*.conf; do
         if [ -f "$conf_file" ]; then
-            grep -E '^listen' "$conf_file" | sed -n 's/.*::0:\([0-9]*\)/\1/p'
+            grep -E '^listen' "$conf_file" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p'
         fi
     done | sort -n | uniq
 }
@@ -209,7 +222,7 @@ list_users() {
         for user_conf in "${SNELL_CONF_DIR}/users"/*; do
             if [ -f "$user_conf" ]; then
                 count=$((count + 1))
-                local port=$(grep -E '^listen' "$user_conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+                local port=$(grep -E '^listen' "$user_conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
                 local psk=$(grep -E '^psk' "$user_conf" | awk -F'=' '{print $2}' | tr -d ' ')
                 echo -e "${GREEN}用户 $count:${RESET}"
                 echo -e "端口: ${port}"
@@ -232,7 +245,7 @@ check_port_usage() {
     if [ -d "${SNELL_CONF_DIR}/users" ]; then
         for conf in "${SNELL_CONF_DIR}/users"/*; do
             if [ -f "$conf" ]; then
-                local used_port=$(grep -E '^listen' "$conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+                local used_port=$(grep -E '^listen' "$conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
                 if [ "$used_port" == "$port" ]; then
                     return 1
                 fi
@@ -241,7 +254,7 @@ check_port_usage() {
     fi
     # 检查主配置文件
     if [ -f "${SNELL_CONF_DIR}/snell-server.conf" ]; then
-        local main_port=$(grep -E '^listen' "${SNELL_CONF_DIR}/snell-server.conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+        local main_port=$(grep -E '^listen' "${SNELL_CONF_DIR}/snell-server.conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
         if [ "$main_port" == "$port" ]; then
             return 1
         fi
@@ -278,6 +291,7 @@ add_user() {
     get_dns
     
     # 创建用户配置文件
+    ensure_snell_service_user
     local user_conf="${SNELL_CONF_DIR}/users/snell-${PORT}.conf"
     cat > "$user_conf" << EOF
 [snell-server]
@@ -297,13 +311,13 @@ After=network.target
 
 [Service]
 Type=simple
-User=nobody
-Group=nogroup
+User=${SNELL_SERVICE_USER}
+Group=${SNELL_SERVICE_GROUP}
 LimitNOFILE=32768
 ExecStart=${INSTALL_DIR}/snell-server -c ${user_conf}
 AmbientCapabilities=CAP_NET_BIND_SERVICE
-StandardOutput=syslog
-StandardError=syslog
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier=snell-server-${PORT}
 
 [Install]
@@ -462,7 +476,7 @@ show_user_config() {
     local user_conf="${SNELL_CONF_DIR}/users/snell-${view_port}.conf"
     
     if [ -f "$user_conf" ]; then
-        local port=$(grep -E '^listen' "$user_conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+        local port=$(grep -E '^listen' "$user_conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
         local psk=$(grep -E '^psk' "$user_conf" | awk -F'=' '{print $2}' | tr -d ' ')
         local dns=$(grep -E '^dns' "$user_conf" | awk -F'=' '{print $2}' | tr -d ' ')
         
@@ -513,7 +527,11 @@ show_menu() {
     echo -e "${GREEN}0.${RESET} 退出脚本"
     
     echo -e "${CYAN}============================================${RESET}"
-    read -rp "请输入选项 [0-5]: " choice
+    if ! read -rp "请输入选项 [0-5]: " choice; then
+        echo
+        echo -e "${YELLOW}未读取到输入，已退出多用户菜单。${RESET}"
+        exit 0
+    fi
 }
 
 # 初始检查
@@ -548,5 +566,5 @@ while true; do
             ;;
     esac
     echo -e "\n${CYAN}按任意键返回主菜单...${RESET}"
-    read -n 1 -s -r
+    read -n 1 -s -r || exit 0
 done 

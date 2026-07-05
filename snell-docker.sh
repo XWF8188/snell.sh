@@ -216,6 +216,8 @@ RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY --from=builder /app/snell-server /app/snell-server
 COPY --from=builder /lib/${gnu_lib_dir}/ /usr/glibc-compat/lib/
+# Snell may depend on libstdc++ and other runtime libraries under /usr/lib.
+COPY --from=builder /usr/lib/${gnu_lib_dir}/ /usr/glibc-compat/lib/
 RUN ${ld_linker_cmd}
 ENV LD_LIBRARY_PATH=/usr/glibc-compat/lib
 RUN mkdir -p /etc/snell
@@ -542,7 +544,7 @@ network_diagnosis() {
     echo -e "${YELLOW}📋 服务配置信息:${RESET}"
     echo "   端口: $port"
     echo "   版本: $version_choice"
-    echo "   PSK: ${psk:0:10}..."
+    echo "   PSK: $(printf '%s' "$psk" | cut -c 1-10)..."
     echo ""
     
     # 1. 检查容器状态
@@ -1135,8 +1137,8 @@ show_menu() {
     echo -e "${GREEN}3.${RESET} 🔄 重启服务"
     echo -e "${GREEN}4.${RESET} 📋 查看配置信息"
     echo -e "${GREEN}5.${RESET} 📊 查看详细状态"
-    echo -e "${GREEN}6.${RESET} � 网络连接诊断"
-    echo -e "${GREEN}7.${RESET} �🐳 Docker 常用命令"
+    echo -e "${GREEN}6.${RESET} 网络连接诊断"
+    echo -e "${GREEN}7.${RESET} Docker 常用命令"
     echo -e "${GREEN}0.${RESET} 🚪 退出脚本"
     echo -e "${CYAN}============================================${RESET}"
     printf "请输入选项 [0-7]: "

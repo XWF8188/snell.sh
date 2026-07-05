@@ -639,7 +639,7 @@ uninstall_snell() {
     
     # 获取端口号
     if [ -f "${SNELL_CONF_FILE}" ]; then
-        PORT=$(grep "listen" ${SNELL_CONF_FILE} | cut -d ":" -f 2)
+        PORT=$(grep "listen" ${SNELL_CONF_FILE} | sed 's/.*://' | tr -d ' ')
         # 关闭防火墙端口
         if command -v firewall-cmd &> /dev/null; then
             firewall-cmd --permanent --remove-port="$PORT"/tcp

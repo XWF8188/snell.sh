@@ -81,7 +81,14 @@ install_dependencies() {
     
     rm -f /tmp/glibc*.apk
     
-    if [ ! -f "/usr/glibc-compat/lib/ld-linux-x86-64.so.2" ]; then
+    case "$(uname -m)" in
+        x86_64|amd64) glibc_loader="/usr/glibc-compat/lib/ld-linux-x86-64.so.2" ;;
+        aarch64|arm64) glibc_loader="/usr/glibc-compat/lib/ld-linux-aarch64.so.1" ;;
+        armv7l|armv7) glibc_loader="/usr/glibc-compat/lib/ld-linux-armhf.so.3" ;;
+        *) glibc_loader="" ;;
+    esac
+
+    if [ -z "$glibc_loader" ] || [ ! -f "$glibc_loader" ]; then
         echo -e "${RED}glibc 安装验证失败！${RESET}"
         return 1
     fi
@@ -446,7 +453,7 @@ uninstall_snell() {
     rc-service snell stop 2>/dev/null
     rc-update del snell default 2>/dev/null
     if [ -f "${SNELL_CONF_FILE}" ]; then
-        PORT_TO_CLOSE=$(grep 'listen' ${SNELL_CONF_FILE} | cut -d':' -f2 | tr -d ' ')
+        PORT_TO_CLOSE=$(grep 'listen' ${SNELL_CONF_FILE} | sed 's/.*://' | tr -d ' ')
         if [ -n "$PORT_TO_CLOSE" ]; then iptables -D INPUT -p tcp --dport "$PORT_TO_CLOSE" -j ACCEPT 2>/dev/null; fi
     fi
     rm -f ${OPENRC_SERVICE_FILE} ${INSTALL_DIR}/snell-server ${INSTALL_DIR}/snell-server-wrapper
@@ -458,7 +465,7 @@ show_information() {
     if [ ! -f "${SNELL_CONF_FILE}" ]; then echo -e "${RED}未找到配置文件。${RESET}"; return; fi
     
     PORT=$(grep 'listen' ${SNELL_CONF_FILE} | sed 's/.*://')
-    PSK=$(grep 'psk' ${SNELL_CONF_FILE} | sed 's/psk\s*=\s*//')
+    PSK=$(grep 'psk' ${SNELL_CONF_FILE} | sed 's/^[^=]*=[[:space:]]*//')
     INSTALLED_VERSION_CHOICE=$(grep 'version-choice' ${SNELL_CONF_FILE} | sed 's/version-choice\s*=\s*//')
     [ -z "$INSTALLED_VERSION_CHOICE" ] && INSTALLED_VERSION_CHOICE="v4"
     

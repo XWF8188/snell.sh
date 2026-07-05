@@ -255,6 +255,119 @@ EGRESS_GW=""
 # 旧的配置文件路径（用于兼容性检查）
 OLD_SNELL_CONF_FILE="${SNELL_CONF_DIR}/snell-server.conf"
 OLD_SYSTEMD_SERVICE_FILE="/lib/systemd/system/snell.service"
+SNELL_SERVICE_USER="snell"
+SNELL_SERVICE_GROUP="snell"
+
+ensure_snell_service_user() {
+    if ! getent group "${SNELL_SERVICE_GROUP}" >/dev/null 2>&1; then
+        groupadd --system "${SNELL_SERVICE_GROUP}" 2>/dev/null || true
+    fi
+
+    if ! getent passwd "${SNELL_SERVICE_USER}" >/dev/null 2>&1; then
+        useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --gid "${SNELL_SERVICE_GROUP}" "${SNELL_SERVICE_USER}" 2>/dev/null || \
+        useradd -r -M -s /usr/sbin/nologin -g "${SNELL_SERVICE_GROUP}" "${SNELL_SERVICE_USER}" 2>/dev/null || true
+    fi
+}
+
+ensure_snell_config_dir() {
+    ensure_snell_service_user
+    mkdir -p "${SNELL_CONF_DIR}/users"
+    if getent group "${SNELL_SERVICE_GROUP}" >/dev/null 2>&1 && getent passwd "${SNELL_SERVICE_USER}" >/dev/null 2>&1; then
+        chown -R "${SNELL_SERVICE_USER}:${SNELL_SERVICE_GROUP}" "${SNELL_CONF_DIR}" 2>/dev/null || true
+    fi
+    chmod 755 "${SNELL_CONF_DIR}" "${SNELL_CONF_DIR}/users" 2>/dev/null || true
+}
+
+migrate_legacy_main_config_if_needed() {
+    ensure_snell_config_dir
+
+    if [ -f "$SNELL_CONF_FILE" ]; then
+        return 0
+    fi
+
+    if [ -f "$OLD_SNELL_CONF_FILE" ]; then
+        cp -a "$OLD_SNELL_CONF_FILE" "$SNELL_CONF_FILE"
+        if getent group "${SNELL_SERVICE_GROUP}" >/dev/null 2>&1 && getent passwd "${SNELL_SERVICE_USER}" >/dev/null 2>&1; then
+            chown "${SNELL_SERVICE_USER}:${SNELL_SERVICE_GROUP}" "$SNELL_CONF_FILE" 2>/dev/null || true
+        fi
+        chmod 644 "$SNELL_CONF_FILE"
+        echo -e "${GREEN}已将旧配置迁移到 ${SNELL_CONF_FILE}${RESET}"
+        return 0
+    fi
+
+    return 1
+}
+
+validate_snell_main_config() {
+    migrate_legacy_main_config_if_needed || true
+
+    if [ ! -s "$SNELL_CONF_FILE" ]; then
+        echo -e "${RED}主配置文件不存在: ${SNELL_CONF_FILE}${RESET}"
+        echo -e "${YELLOW}请先执行安装，或将旧配置放到该路径后再启动服务。${RESET}"
+        return 1
+    fi
+
+    if ! grep -Eq '^[[:space:]]*listen[[:space:]]*=' "$SNELL_CONF_FILE"; then
+        echo -e "${RED}主配置缺少 listen 配置: ${SNELL_CONF_FILE}${RESET}"
+        return 1
+    fi
+
+    if ! grep -Eq '^[[:space:]]*psk[[:space:]]*=' "$SNELL_CONF_FILE"; then
+        echo -e "${RED}主配置缺少 psk 配置: ${SNELL_CONF_FILE}${RESET}"
+        return 1
+    fi
+
+    return 0
+}
+
+write_main_systemd_service() {
+    ensure_snell_config_dir
+    cat > ${SYSTEMD_SERVICE_FILE} << EOF
+[Unit]
+Description=Snell Proxy Service (Main)
+After=network.target
+
+[Service]
+Type=simple
+User=${SNELL_SERVICE_USER}
+Group=${SNELL_SERVICE_GROUP}
+LimitNOFILE=32768
+ExecStart=${INSTALL_DIR}/snell-server -c ${SNELL_CONF_FILE}
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Restart=on-failure
+RestartSec=2s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=snell-server
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+sync_existing_main_service_unit() {
+    if [ ! -f "$SYSTEMD_SERVICE_FILE" ]; then
+        return 0
+    fi
+
+    if systemctl is-enabled --quiet snell.socket 2>/dev/null; then
+        return 0
+    fi
+
+    if grep -q "NetworkNamespacePath=" "$SYSTEMD_SERVICE_FILE"; then
+        return 0
+    fi
+
+    if ! grep -q "ExecStart=${INSTALL_DIR}/snell-server -c ${SNELL_CONF_FILE}" "$SYSTEMD_SERVICE_FILE"; then
+        return 0
+    fi
+
+    if grep -q "StandardOutput=syslog\\|StandardError=syslog\\|User=nobody\\|Group=nogroup" "$SYSTEMD_SERVICE_FILE"; then
+        write_main_systemd_service
+        systemctl daemon-reload 2>/dev/null || true
+        echo -e "${GREEN}已更新 snell.service systemd 配置。${RESET}"
+    fi
+}
 
 # 根据 /30 子网生成 host/ns 地址与网关
 apply_egress_subnet() {
@@ -321,8 +434,17 @@ check_and_migrate_config() {
     local need_migration=false
     local old_files_exist=false
 
-    # 检查旧的配置文件是否存在
-    if [ -f "$OLD_SNELL_CONF_FILE" ] || [ -f "$OLD_SYSTEMD_SERVICE_FILE" ]; then
+    # 自动修复 4.x -> 5.x 后服务指向新路径、配置仍在旧路径导致的启动失败。
+    if [ ! -f "$SNELL_CONF_FILE" ] && [ -f "$OLD_SNELL_CONF_FILE" ]; then
+        migrate_legacy_main_config_if_needed
+        if [ -f "$SYSTEMD_SERVICE_FILE" ] && ! systemctl is-enabled --quiet snell.socket 2>/dev/null; then
+            write_main_systemd_service
+            systemctl daemon-reload 2>/dev/null || true
+        fi
+    fi
+
+    # 检查仍需人工处理的旧配置。若主配置已自动迁移成功，仅保留旧文件不再反复提示。
+    if { [ ! -f "$SNELL_CONF_FILE" ] && [ -f "$OLD_SNELL_CONF_FILE" ]; } || [ -f "$OLD_SYSTEMD_SERVICE_FILE" ]; then
         old_files_exist=true
         echo -e "\n${YELLOW}检测到旧版本的 Snell 配置文件${RESET}"
         echo -e "旧配置位置："
@@ -334,7 +456,8 @@ check_and_migrate_config() {
             need_migration=true
             mkdir -p "${SNELL_CONF_DIR}/users"
             # 设置正确的目录权限
-            chown -R nobody:nogroup "${SNELL_CONF_DIR}"
+            ensure_snell_service_user
+            chown -R "${SNELL_SERVICE_USER}:${SNELL_SERVICE_GROUP}" "${SNELL_CONF_DIR}"
             chmod -R 755 "${SNELL_CONF_DIR}"
         fi
     fi
@@ -353,16 +476,15 @@ check_and_migrate_config() {
             if [ -f "$OLD_SNELL_CONF_FILE" ]; then
                 cp "$OLD_SNELL_CONF_FILE" "${SNELL_CONF_FILE}"
                 # 设置正确的文件权限
-                chown nobody:nogroup "${SNELL_CONF_FILE}"
+                ensure_snell_service_user
+                chown "${SNELL_SERVICE_USER}:${SNELL_SERVICE_GROUP}" "${SNELL_CONF_FILE}"
                 chmod 644 "${SNELL_CONF_FILE}"
                 echo -e "${GREEN}已迁移配置文件${RESET}"
             fi
             
             # 迁移服务文件
             if [ -f "$OLD_SYSTEMD_SERVICE_FILE" ]; then
-                # 更新服务文件中的配置文件路径
-                sed -e "s|${OLD_SNELL_CONF_FILE}|${SNELL_CONF_FILE}|g" "$OLD_SYSTEMD_SERVICE_FILE" > "$SYSTEMD_SERVICE_FILE"
-                chmod 644 "$SYSTEMD_SERVICE_FILE"
+                write_main_systemd_service
                 echo -e "${GREEN}已迁移服务文件${RESET}"
             fi
             
@@ -377,7 +499,9 @@ check_and_migrate_config() {
             
             # 重新加载服务
             systemctl daemon-reload
-            systemctl start snell
+            if validate_snell_main_config; then
+                systemctl start snell
+            fi
             
             # 验证服务状态
             if systemctl is-active --quiet snell; then
@@ -754,8 +878,8 @@ After=snell-netns.service
 Type=simple
 NetworkNamespacePath=/run/netns/${EGRESS_NS}
 BindReadOnlyPaths=/etc/netns/${EGRESS_NS}/resolv.conf:/etc/resolv.conf
-User=nobody
-Group=nogroup
+User=${SNELL_SERVICE_USER}
+Group=${SNELL_SERVICE_GROUP}
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
@@ -770,8 +894,8 @@ WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/snell-server -c ${SNELL_CONF_FILE}
 Restart=on-failure
 RestartSec=2s
-StandardOutput=syslog
-StandardError=syslog
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier=snell-server
 
 [Install]
@@ -989,6 +1113,54 @@ open_port() {
     fi
 }
 
+close_nftables_port() {
+    local PORT=$1
+
+    if ! command -v nft &> /dev/null; then
+        return
+    fi
+
+    nft -a list ruleset 2>/dev/null | awk -v port="$PORT" '
+        $1 == "table" {
+            family=$2
+            table=$3
+            gsub(/[{}]/, "", table)
+        }
+        $1 == "chain" {
+            chain=$2
+            gsub(/[{}]/, "", chain)
+        }
+        ($0 ~ "tcp dport " port " .*accept" || $0 ~ "udp dport " port " .*accept") && /# handle/ {
+            handle=$NF
+            print family " " table " " chain " " handle
+        }
+    ' | while read -r family table chain handle; do
+        [ -z "$handle" ] && continue
+        nft delete rule "$family" "$table" "$chain" handle "$handle" 2>/dev/null || true
+    done
+
+    save_nftables_rules
+}
+
+close_port() {
+    local PORT=$1
+
+    if command -v ufw &> /dev/null; then
+        ufw delete allow "$PORT"/tcp >/dev/null 2>&1 || true
+        ufw delete allow "$PORT"/udp >/dev/null 2>&1 || true
+    fi
+
+    if command -v iptables &> /dev/null; then
+        iptables -D INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport "$PORT" -j ACCEPT 2>/dev/null || true
+        if [ -d "/etc/iptables" ]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+    fi
+
+    close_nftables_port "$PORT"
+}
+
 # 启用 egress 运行时：优先 socket + service；失败回退为 netns 直启服务
 start_egress_runtime() {
     local port="$1"
@@ -1081,25 +1253,7 @@ ipv6 = true
 dns = ${DNS}
 EOF
 
-    cat > ${SYSTEMD_SERVICE_FILE} << EOF
-[Unit]
-Description=Snell Proxy Service (Main)
-After=network.target
-
-[Service]
-Type=simple
-User=nobody
-Group=nogroup
-LimitNOFILE=32768
-ExecStart=${INSTALL_DIR}/snell-server -c ${SNELL_CONF_FILE}
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-StandardOutput=syslog
-StandardError=syslog
-SyslogIdentifier=snell-server
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    write_main_systemd_service
 
     if [ "$EGRESS_FEATURE_ENABLED" = "true" ]; then
         write_snell_netns_service
@@ -1140,6 +1294,10 @@ EOF
         systemctl enable snell
         if [ $? -ne 0 ]; then
             echo -e "${RED}开机自启动 Snell 失败。${RESET}"
+            exit 1
+        fi
+
+        if ! validate_snell_main_config; then
             exit 1
         fi
 
@@ -1321,31 +1479,16 @@ configure_v5_egress_control() {
             systemctl stop snell-netns 2>/dev/null
             systemctl disable snell-netns 2>/dev/null
 
-            cat > ${SYSTEMD_SERVICE_FILE} << EOF
-[Unit]
-Description=Snell Proxy Service (Main)
-After=network.target
-
-[Service]
-Type=simple
-User=nobody
-Group=nogroup
-LimitNOFILE=32768
-ExecStart=${INSTALL_DIR}/snell-server -c ${SNELL_CONF_FILE}
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-StandardOutput=syslog
-StandardError=syslog
-SyslogIdentifier=snell-server
-
-[Install]
-WantedBy=multi-user.target
-EOF
+            write_main_systemd_service
 
             rm -f ${SYSTEMD_SOCKET_FILE}
             rm -f ${SYSTEMD_NETNS_FILE}
 
             systemctl daemon-reload
             systemctl enable snell
+            if ! validate_snell_main_config; then
+                return 1
+            fi
             systemctl restart snell
 
             echo -e "${GREEN}已关闭出口控制，恢复传统模式。${RESET}"
@@ -1402,19 +1545,26 @@ update_snell_binary() {
     chmod +x ${INSTALL_DIR}/snell-server
 
     echo -e "${CYAN}正在重启 Snell 服务...${RESET}"
+    if ! validate_snell_main_config; then
+        restore_snell_config "$backup_dir"
+        return 1
+    fi
+
     # 重启主服务
     systemctl restart snell
     if [ $? -ne 0 ]; then
         echo -e "${RED}主服务重启失败，尝试恢复配置...${RESET}"
         restore_snell_config "$backup_dir"
-        systemctl restart snell
+        if validate_snell_main_config; then
+            systemctl restart snell
+        fi
     fi
 
     # 重启所有多用户服务
     if [ -d "${SNELL_CONF_DIR}/users" ]; then
         for user_conf in "${SNELL_CONF_DIR}/users"/*; do
             if [ -f "$user_conf" ] && [[ "$user_conf" != *"snell-main.conf" ]]; then
-                local port=$(grep -E '^listen' "$user_conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+                local port=$(grep -E '^listen' "$user_conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
                 if [ ! -z "$port" ]; then
                     systemctl restart "snell-${port}" 2>/dev/null
                 fi
@@ -1435,9 +1585,29 @@ update_snell_binary() {
 uninstall_snell() {
     echo -e "${CYAN}正在卸载 Snell${RESET}"
 
+    # 停止并删除依赖 Snell 后端的 ShadowTLS 服务，避免留下无后端的监听服务
+    local snell_shadowtls_services
+    snell_shadowtls_services=$(find "${SYSTEMD_DIR}" -maxdepth 1 -name "shadowtls-snell-*.service" 2>/dev/null)
+    if [ -n "$snell_shadowtls_services" ]; then
+        while IFS= read -r service_file; do
+            [ -z "$service_file" ] && continue
+            local service_name
+            service_name=$(basename "$service_file")
+            local shadowtls_port
+            shadowtls_port=$(sed -n 's/.*--listen .*:\([0-9][0-9]*\).*/\1/p' "$service_file" | head -n 1)
+            echo -e "${YELLOW}正在停止 ShadowTLS 服务 (${service_name})${RESET}"
+            systemctl stop "$service_name" 2>/dev/null
+            systemctl disable "$service_name" 2>/dev/null
+            rm -f "$service_file"
+            if [ -n "$shadowtls_port" ]; then
+                close_port "$shadowtls_port"
+            fi
+        done <<< "$snell_shadowtls_services"
+    fi
+
     # 停止并禁用主服务
-    systemctl stop snell
-    systemctl disable snell
+    systemctl stop snell 2>/dev/null
+    systemctl disable snell 2>/dev/null
     systemctl stop snell.socket 2>/dev/null
     systemctl disable snell.socket 2>/dev/null
     systemctl stop snell-netns 2>/dev/null
@@ -1447,12 +1617,13 @@ uninstall_snell() {
     if [ -d "${SNELL_CONF_DIR}/users" ]; then
         for user_conf in "${SNELL_CONF_DIR}/users"/*; do
             if [ -f "$user_conf" ]; then
-                local port=$(grep -E '^listen' "$user_conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+                local port=$(grep -E '^listen' "$user_conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
                 if [ ! -z "$port" ]; then
                     echo -e "${YELLOW}正在停止用户服务 (端口: $port)${RESET}"
                     systemctl stop "snell-${port}" 2>/dev/null
                     systemctl disable "snell-${port}" 2>/dev/null
                     rm -f "${SYSTEMD_DIR}/snell-${port}.service"
+                    close_port "$port"
                 fi
             fi
         done
@@ -1469,6 +1640,10 @@ uninstall_snell() {
     rm -f /usr/local/bin/snell-server
     rm -rf ${SNELL_CONF_DIR}
     rm -f /usr/local/bin/snell  # 删除管理脚本
+
+    if ! find "${SYSTEMD_DIR}" -maxdepth 1 -name "shadowtls-*.service" 2>/dev/null | grep -q .; then
+        rm -f /usr/local/bin/shadow-tls
+    fi
     
     # 重载 systemd 配置
     systemctl daemon-reload
@@ -1479,6 +1654,11 @@ uninstall_snell() {
 # 重启 Snell
 restart_snell() {
     echo -e "${YELLOW}正在重启所有 Snell 服务...${RESET}"
+
+    if ! validate_snell_main_config; then
+        echo -e "${RED}已取消重启，避免 snell-server 在缺少配置时崩溃。${RESET}"
+        return 1
+    fi
     
     # 若使用 socket activation，先重启 socket 与 netns，再重启服务
     if systemctl list-unit-files | grep -q '^snell.socket'; then
@@ -1498,7 +1678,7 @@ restart_snell() {
     if [ -d "${SNELL_CONF_DIR}/users" ]; then
         for user_conf in "${SNELL_CONF_DIR}/users"/*; do
             if [ -f "$user_conf" ] && [[ "$user_conf" != *"snell-main.conf" ]]; then
-                local port=$(grep -E '^listen' "$user_conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+                local port=$(grep -E '^listen' "$user_conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
                 if [ ! -z "$port" ]; then
                     echo -e "${YELLOW}正在重启用户服务 (端口: $port)${RESET}"
                     systemctl restart "snell-${port}" 2>/dev/null
@@ -1557,7 +1737,7 @@ check_and_show_status() {
         if [ -d "${SNELL_CONF_DIR}/users" ]; then
             for user_conf in "${SNELL_CONF_DIR}/users"/*; do
                 if [ -f "$user_conf" ] && [[ "$user_conf" != *"snell-main.conf" ]]; then
-                    local port=$(grep -E '^listen' "$user_conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+                    local port=$(grep -E '^listen' "$user_conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
                     if [ ! -z "$port" ]; then
                         user_count=$((user_count + 1))
                         if systemctl is-active --quiet "snell-${port}"; then
@@ -1678,7 +1858,7 @@ view_snell_config() {
     local main_conf="${SNELL_CONF_DIR}/users/snell-main.conf"
     if [ -f "$main_conf" ]; then
         echo -e "\n${GREEN}主用户配置：${RESET}"
-        local main_port=$(grep -E '^listen' "$main_conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+        local main_port=$(grep -E '^listen' "$main_conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
         local main_psk=$(grep -E '^psk' "$main_conf" | awk -F'=' '{print $2}' | tr -d ' ')
         local main_ipv6=$(grep -E '^ipv6' "$main_conf" | awk -F'=' '{print $2}' | tr -d ' ')
         local main_dns=$(grep -E '^dns' "$main_conf" | awk -F'=' '{print $2}' | tr -d ' ')
@@ -1701,7 +1881,7 @@ view_snell_config() {
     if [ -d "${SNELL_CONF_DIR}/users" ]; then
         for user_conf in "${SNELL_CONF_DIR}/users"/*; do
             if [ -f "$user_conf" ] && [[ "$user_conf" != *"snell-main.conf" ]]; then
-                local user_port=$(grep -E '^listen' "$user_conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+                local user_port=$(grep -E '^listen' "$user_conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
                 local user_psk=$(grep -E '^psk' "$user_conf" | awk -F'=' '{print $2}' | tr -d ' ')
                 local user_ipv6=$(grep -E '^ipv6' "$user_conf" | awk -F'=' '{print $2}' | tr -d ' ')
                 local user_dns=$(grep -E '^dns' "$user_conf" | awk -F'=' '{print $2}' | tr -d ' ')
@@ -2057,6 +2237,7 @@ initial_check() {
     check_curl
     check_bc
     check_and_migrate_config
+    sync_existing_main_service_unit
     check_and_show_status
 }
 
@@ -2105,7 +2286,11 @@ show_menu() {
     echo -e "${GREEN}0.${RESET} 退出脚本"
     
     echo -e "${CYAN}============================================${RESET}"
-    read -rp "请输入选项 [0-11]: " num
+    if ! read -rp "请输入选项 [0-11]: " num; then
+        echo
+        echo -e "${YELLOW}未读取到输入，已退出 Snell 菜单。${RESET}"
+        exit 0
+    fi
 }
 
 #开启bbr
@@ -2133,7 +2318,7 @@ setup_shadowtls() {
 # 获取 Snell 端口
 get_snell_port() {
     if [ -f "${SNELL_CONF_DIR}/users/snell-main.conf" ]; then
-        grep -E '^listen' "${SNELL_CONF_DIR}/users/snell-main.conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p'
+        grep -E '^listen' "${SNELL_CONF_DIR}/users/snell-main.conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p'
     fi
 }
 
@@ -2148,7 +2333,7 @@ get_all_snell_users() {
     local main_port=""
     local main_psk=""
     if [ -f "${SNELL_CONF_DIR}/users/snell-main.conf" ]; then
-        main_port=$(grep -E '^listen' "${SNELL_CONF_DIR}/users/snell-main.conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+        main_port=$(grep -E '^listen' "${SNELL_CONF_DIR}/users/snell-main.conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
         main_psk=$(grep -E '^psk' "${SNELL_CONF_DIR}/users/snell-main.conf" | awk -F'=' '{print $2}' | tr -d ' ')
         if [ ! -z "$main_port" ] && [ ! -z "$main_psk" ]; then
             echo "${main_port}|${main_psk}"
@@ -2158,7 +2343,7 @@ get_all_snell_users() {
     # 获取其他用户配置
     for user_conf in "${SNELL_CONF_DIR}/users"/snell-*.conf; do
         if [ -f "$user_conf" ] && [[ "$user_conf" != *"snell-main.conf" ]]; then
-            local port=$(grep -E '^listen' "$user_conf" | sed -n 's/.*::0:\([0-9]*\)/\1/p')
+            local port=$(grep -E '^listen' "$user_conf" | sed -n 's/^[[:space:]]*listen[[:space:]]*=.*:\([0-9][0-9]*\).*/\1/p')
             local psk=$(grep -E '^psk' "$user_conf" | awk -F'=' '{print $2}' | tr -d ' ')
             if [ ! -z "$port" ] && [ ! -z "$psk" ]; then
                 echo "${port}|${psk}"
@@ -2200,11 +2385,11 @@ while true; do
             ;;
         10)
             check_and_show_status
-            read -p "按任意键继续..."
+            read -p "按任意键继续..." || exit 0
             ;;
         11)
             configure_v5_egress_control
-            read -p "按任意键继续..."
+            read -p "按任意键继续..." || exit 0
             ;;
         0)
             echo -e "${GREEN}感谢使用，再见！${RESET}"
@@ -2215,5 +2400,5 @@ while true; do
             ;;
     esac
     echo -e "\n${CYAN}按任意键返回主菜单...${RESET}"
-    read -n 1 -s -r
+    read -n 1 -s -r || exit 0
 done
