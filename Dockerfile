@@ -8,6 +8,7 @@
 ARG SNELL_VERSION=v5.0.1
 ARG SNELL_VER=v5
 ARG SHADOWTLS_VERSION=v0.2.25
+ARG BUILD_CREATED
 
 # 第一阶段: 使用 Debian 下载二进制并提供 glibc 运行时库
 FROM debian:bookworm-slim AS builder
@@ -53,6 +54,7 @@ ARG TARGETARCH
 ARG SNELL_VERSION
 ARG SNELL_VER
 ARG SHADOWTLS_VERSION
+ARG BUILD_CREATED
 
 RUN apk add --no-cache ca-certificates
 
@@ -106,6 +108,7 @@ ENV SNELL_VER=${SNELL_VER}
 
 LABEL org.opencontainers.image.title="Snell Server" \
       org.opencontainers.image.version="${SNELL_VERSION}" \
+      org.opencontainers.image.created="${BUILD_CREATED}" \
       org.opencontainers.image.source="https://github.com/jinqians/snell.sh"
 
 # 创建配置目录和 entrypoint 脚本

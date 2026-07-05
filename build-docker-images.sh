@@ -8,6 +8,7 @@ USE_BUILDX="${USE_BUILDX:-0}"
 PROVENANCE="${PROVENANCE:-false}"
 DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-1}"
 export DOCKER_BUILDKIT
+BUILD_CREATED="${BUILD_CREATED:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
 V4_LATEST="${V4_VERSION:-v4.1.1}"
 V5_LATEST="${V5_VERSION:-v5.0.1}"
@@ -33,27 +34,13 @@ require_docker() {
     fi
 }
 
-tag_args() {
-    channel="$1"
-    version="$2"
-    latest_version="$3"
-
-    printf ' -t %s:%s' "$IMAGE_NAME" "$version"
-    if [ "$version" = "$latest_version" ]; then
-        printf ' -t %s:%s' "$IMAGE_NAME" "$channel"
-    fi
-    if [ "$channel" = "$LATEST_CHANNEL" ] && [ "$version" = "$latest_version" ]; then
-        printf ' -t %s:latest' "$IMAGE_NAME"
-    fi
-}
-
 build_one() {
     channel="$1"
     version="$2"
     platforms="$3"
-    latest_version="$4"
+    tag="$4"
 
-    echo "==> Building ${IMAGE_NAME} ${channel} (${version})"
+    echo "==> Building ${IMAGE_NAME}:${tag} from Snell ${version} (${channel})"
 
     if [ "$USE_BUILDX" = "1" ]; then
         output="--load"
@@ -71,7 +58,8 @@ build_one() {
             --build-arg "SNELL_VERSION=$version" \
             --build-arg "SNELL_VER=$channel" \
             --build-arg "SHADOWTLS_VERSION=$SHADOWTLS_VERSION" \
-            $(tag_args "$channel" "$version" "$latest_version") \
+            --build-arg "BUILD_CREATED=$BUILD_CREATED" \
+            -t "$IMAGE_NAME:$tag" \
             $output \
             .
     else
@@ -80,7 +68,8 @@ build_one() {
             --build-arg "SNELL_VERSION=$version" \
             --build-arg "SNELL_VER=$channel" \
             --build-arg "SHADOWTLS_VERSION=$SHADOWTLS_VERSION" \
-            $(tag_args "$channel" "$version" "$latest_version") \
+            --build-arg "BUILD_CREATED=$BUILD_CREATED" \
+            -t "$IMAGE_NAME:$tag" \
             .
     fi
 }
@@ -88,20 +77,46 @@ build_one() {
 build_versions() {
     channel="$1"
     versions="$2"
-    latest_version="$3"
-    platforms="$4"
+    platforms="$3"
 
     for version in $versions; do
-        build_one "$channel" "$version" "$platforms" "$latest_version"
+        build_one "$channel" "$version" "$platforms" "$version"
     done
+}
+
+build_alias() {
+    channel="$1"
+    latest_version="$2"
+    platforms="$3"
+
+    build_one "$channel" "$latest_version" "$platforms" "$channel"
+}
+
+build_latest() {
+    case "$LATEST_CHANNEL" in
+        v4) build_one "v4" "$V4_LATEST" "$V4_PLATFORMS" "latest" ;;
+        v5) build_one "v5" "$V5_LATEST" "$V5_PLATFORMS" "latest" ;;
+        v6) build_one "v6" "$V6_LATEST" "$V6_PLATFORMS" "latest" ;;
+        *)
+            echo "Unsupported LATEST_CHANNEL: $LATEST_CHANNEL" >&2
+            exit 1
+            ;;
+    esac
 }
 
 main() {
     require_docker
 
-    build_versions "v4" "$V4_VERSIONS" "$V4_LATEST" "$V4_PLATFORMS"
-    build_versions "v5" "$V5_VERSIONS" "$V5_LATEST" "$V5_PLATFORMS"
-    build_versions "v6" "$V6_VERSIONS" "$V6_LATEST" "$V6_PLATFORMS"
+    build_versions "v4" "$V4_VERSIONS" "$V4_PLATFORMS"
+    build_alias "v4" "$V4_LATEST" "$V4_PLATFORMS"
+
+    build_versions "v5" "$V5_VERSIONS" "$V5_PLATFORMS"
+    build_alias "v5" "$V5_LATEST" "$V5_PLATFORMS"
+
+    build_versions "v6" "$V6_VERSIONS" "$V6_PLATFORMS"
+    build_alias "v6" "$V6_LATEST" "$V6_PLATFORMS"
+
+    build_latest
 
     echo
     echo "Built images:"
