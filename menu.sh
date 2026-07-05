@@ -14,7 +14,7 @@ CYAN='\033[0;36m'
 RESET='\033[0m'
 
 # 当前版本号
-current_version="4.1"
+current_version="4.2"
 
 # 安装全局命令
 install_global_command() {

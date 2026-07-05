@@ -192,7 +192,7 @@ close_nftables_port() {
             chain=$2
             gsub(/[{}]/, "", chain)
         }
-        $0 ~ "tcp dport " port " .*accept" && /# handle/ {
+        ($0 ~ "tcp dport " port " .*accept" || $0 ~ "udp dport " port " .*accept") && /# handle/ {
             handle=$NF
             print family " " table " " chain " " handle
         }
@@ -209,10 +209,12 @@ close_port() {
 
     if command -v ufw >/dev/null 2>&1; then
         ufw delete allow "$port"/tcp >/dev/null 2>&1 || true
+        ufw delete allow "$port"/udp >/dev/null 2>&1 || true
     fi
 
     if command -v iptables >/dev/null 2>&1; then
         iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
         if [ -d "/etc/iptables" ]; then
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
         fi
@@ -386,6 +388,90 @@ get_all_snell_users() {
             fi
         fi
     done
+}
+
+get_snell_config_file_by_port() {
+    local target_port=$1
+    local conf
+    local port
+
+    migrate_legacy_snell_config >/dev/null 2>&1 || true
+
+    for conf in "${SNELL_CONF_FILE}" "${USERS_DIR}"/snell-*.conf; do
+        [ -f "$conf" ] || continue
+        port=$(sed -n 's/^[[:space:]]*listen[[:space:]]*=[[:space:]]*.*:\([0-9][0-9]*\)[[:space:]]*$/\1/p' "$conf" | head -n 1)
+        if [ "$port" = "$target_port" ]; then
+            echo "$conf"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+get_snell_service_name_by_config() {
+    local conf=$1
+    local filename
+
+    if [ "$conf" = "${SNELL_CONF_FILE}" ]; then
+        echo "snell"
+        return 0
+    fi
+
+    filename=$(basename "$conf")
+    case "$filename" in
+        snell-[0-9]*.conf)
+            echo "${filename%.conf}"
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+restrict_snell_to_loopback() {
+    local port=$1
+    local conf
+    local service_name
+
+    conf=$(get_snell_config_file_by_port "$port") || {
+        echo -e "${RED}未找到 Snell 端口 ${port} 对应的配置文件${RESET}"
+        return 1
+    }
+
+    service_name=$(get_snell_service_name_by_config "$conf") || {
+        echo -e "${RED}无法识别 Snell 端口 ${port} 对应的 systemd 服务${RESET}"
+        return 1
+    }
+
+    if [ "$service_name" = "snell" ] && { systemctl is-active --quiet snell.socket 2>/dev/null || systemctl is-enabled --quiet snell.socket 2>/dev/null; }; then
+        echo -e "${RED}检测到 snell.socket 正在使用，暂不能自动将主 Snell 改为 ShadowTLS 后端模式${RESET}"
+        echo -e "${YELLOW}请先在 Snell 管理脚本中关闭出口控制/socket 激活模式，再配置 ShadowTLS。${RESET}"
+        return 1
+    fi
+
+    if grep -Eq "^[[:space:]]*listen[[:space:]]*=[[:space:]]*127\\.0\\.0\\.1:${port}[[:space:]]*$" "$conf"; then
+        echo -e "${GREEN}Snell 端口 ${port} 已仅监听 127.0.0.1${RESET}"
+    else
+        cp -a "$conf" "${conf}.bak.$(date +%Y%m%d%H%M%S)"
+        sed -i "s|^[[:space:]]*listen[[:space:]]*=.*:${port}[[:space:]]*$|listen = 127.0.0.1:${port}|" "$conf"
+
+        if ! grep -Eq "^[[:space:]]*listen[[:space:]]*=[[:space:]]*127\\.0\\.0\\.1:${port}[[:space:]]*$" "$conf"; then
+            echo -e "${RED}修改 Snell 监听地址失败: ${conf}${RESET}"
+            return 1
+        fi
+
+        if getent group "${SNELL_SERVICE_GROUP}" >/dev/null 2>&1 && getent passwd "${SNELL_SERVICE_USER}" >/dev/null 2>&1; then
+            chown "${SNELL_SERVICE_USER}:${SNELL_SERVICE_GROUP}" "$conf" 2>/dev/null || true
+        fi
+        chmod 644 "$conf" 2>/dev/null || true
+
+        echo -e "${GREEN}已将 Snell 端口 ${port} 改为仅监听 127.0.0.1${RESET}"
+    fi
+
+    systemctl restart "$service_name"
+    close_port "$port"
+    echo -e "${GREEN}已关闭 Snell 原始端口 ${port} 的公网放行规则，客户端请连接 ShadowTLS 端口${RESET}"
 }
 
 # 获取 Snell 版本
@@ -943,6 +1029,8 @@ install_shadowtls() {
                 
                 echo -e "${GREEN}将使用端口: ${stls_port}${RESET}"
                 
+                restrict_snell_to_loopback "$port" || return 1
+
                 # 创建服务文件
                 create_shadowtls_service "snell" "$port" "$stls_port" "$tls_domain" "$password"
                 open_port "$stls_port"
@@ -966,6 +1054,8 @@ install_shadowtls() {
             
             echo -e "${GREEN}将使用端口: ${stls_port}${RESET}"
             
+            restrict_snell_to_loopback "$selected_port" || return 1
+
             # 创建服务文件
             create_shadowtls_service "snell" "$selected_port" "$stls_port" "$tls_domain" "$password"
             open_port "$stls_port"
@@ -1343,6 +1433,8 @@ add_shadowtls_config() {
                             echo -e "${YELLOW}请重新输入端口${RESET}"
                         done
                         
+                        restrict_snell_to_loopback "$port" || return 1
+
                         # 创建服务文件
                         create_shadowtls_service "snell" "$port" "$stls_port" "$tls_domain" "$password"
                         open_port "$stls_port"
@@ -1369,6 +1461,8 @@ add_shadowtls_config() {
                         echo -e "${YELLOW}请重新输入端口${RESET}"
                     done
                     
+                    restrict_snell_to_loopback "$selected_port" || return 1
+
                     # 创建服务文件
                     create_shadowtls_service "snell" "$selected_port" "$stls_port" "$tls_domain" "$password"
                     open_port "$stls_port"
