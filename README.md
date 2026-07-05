@@ -1,82 +1,55 @@
 [中文](README.md) ｜ [English](README.en.md)
-## Snell 协议
-<details>
-   <summary>协议简介[展开查看]</summary>
-   
-### Snell 协议
-Snell 协议是由 Surge 团队设计的一种轻量级、高效的加密代理协议，专注于提供安全、快速的网络传输服务。该协议通过简洁的设计和强大的加密技术，满足了用户对隐私保护和高性能传输的需求。
 
-#### Snell v4 vs v5 对比
-| 特性 | Snell v4 | Snell v5 |
-|------|----------|----------|
-| 状态 | 稳定版 | 最新版 |
-| 安全性 | ✅ | ✅ |
-| QUIC Proxy | ❌ | ✅ |
-| Dynamic Record Sizing | ❌ | ✅ |
-| 出口控制 | ❌ | ✅ |
+# Snell 一键脚本与 Docker 镜像
 
-### ShadowTLS
-ShadowTLS 是一个轻量级的 TLS 伪装工具，能够有效规避 TLS 指纹检测。它通过模拟正常的 HTTPS 流量，提供更好的隐私保护和连接稳定性。
+支持 Snell v4 / v5 / v6、Snell 多用户、ShadowTLS v3、流量管理，以及 Docker / Docker Compose 部署。
 
-## 脚本介绍
-该管理脚本为基于 Linux 系统的 Snell 和 ShadowTLS 代理服务提供了高效、自动化的管理解决方案，已支持debian、ubuntu、centos、alpine。脚本支持一键部署 Snell v4/v5 或 Snell + ShadowTLS 组合，通过简洁的命令实现安装、配置、版本控制以及卸载，帮助用户快速搭建安全可靠的代理服务。
-</details>
+## 脚本安装
 
-## 食用说明
-<details>
-   <summary>脚本食用说明[展开查看]</summary>
-   
-脚本自行判断系统，选择对应安装脚本
-### snell 安装
+### 自动识别系统安装
+
 ```bash
 sh -c "$(curl -fsSL https://install.jinqians.com)"
 ```
-### 多功能管理菜单使用(仅支持debian/ubuntu)
+
+### Debian / Ubuntu 多功能管理菜单
+
+推荐 Debian / Ubuntu 用户优先使用管理菜单，可安装和管理 Snell、ShadowTLS、多用户、流量限制等功能。
+
 ```bash
 bash <(curl -L -s menu.jinqians.com)
 ```
 
-## 可自行根据系统选择
-#### Debian/Ubuntu安装
-```bash
-bash <(curl -L -s snell.jinqians.com)
-```
-#### CentOS安装
-```bash
-bash <(curl -L -s snell-centos.jinqians.com)
-```
-#### Alpine 安装(本地构建)
-```bash
-sh -c "$(curl -fsSL https://snell-docker.jinqians.com)"
-```
-#### Alpine 3.18安装
-```bash
-sh -c "$(curl -fsSL https://snell-alpine.jinqians.com)"
-```
-#### Docker
-Docker Hub 镜像：
-- `jinqians/snell-server:v4` / `v4.1.1`: Snell v4.1.1
-- `jinqians/snell-server:v5` / `v5.0.1`: Snell v5.0.1
-- `jinqians/snell-server:v6` / `v6.0.0b2`: Snell v6.0.0b2
-- `jinqians/snell-server:latest`: 当前固定指向 v5，不指向 v6
+### 按系统选择脚本
+
+| 系统 | 命令 | 说明 |
+|------|------|------|
+| Debian / Ubuntu | `bash <(curl -L -s snell.jinqians.com)` | Snell 主安装脚本 |
+| CentOS | `bash <(curl -L -s snell-centos.jinqians.com)` | CentOS 版 Snell 安装脚本 |
+| Alpine 本地构建 | `sh -c "$(curl -fsSL https://snell-docker.jinqians.com)"` | Alpine 本地构建安装 |
+| Alpine 3.18 | `sh -c "$(curl -fsSL https://snell-alpine.jinqians.com)"` | Alpine 3.18 安装 |
+
+### ShadowTLS 说明
+
+在脚本中为 Snell 配置 ShadowTLS 后，脚本会把 Snell 后端改为仅监听 `127.0.0.1:Snell端口`，客户端只连接 ShadowTLS 对外端口。这样可以避免原始 Snell 端口继续暴露在公网。
+
+## Docker 快速使用
+
+Docker Hub 镜像：`jinqians/snell-server`
+
+| 标签 | 版本 | 说明 |
+|------|------|------|
+| `latest` | Snell v5.0.1 | 固定指向 v5，不指向 v6 |
+| `v5` / `v5.0.1` | Snell v5.0.1 | 推荐使用 |
+| `v4` / `v4.1.1` | Snell v4.1.1 | 稳定版 |
+| `v6` / `v6.0.0b2` | Snell v6 beta | 测试版 |
 
 架构支持：
-- v4/v5: `linux/amd64`、`linux/arm64`、`linux/arm/v7`
+- v4 / v5: `linux/amd64`、`linux/arm64`、`linux/arm/v7`
 - v6: `linux/amd64`、`linux/arm64`
 
-安装 Docker 后，直接运行 v5：
-```bash
-docker run -d --name snell-server \
-  --restart unless-stopped \
-  -p 6160:6160/tcp \
-  -p 6160:6160/udp \
-  -e SNELL_PORT=6160 \
-  -e SNELL_PSK=your_16_plus_char_psk \
-  -e SNELL_VER=v5 \
-  jinqians/snell-server:v5
-```
+### 运行 Snell v5
 
-不传入 `SNELL_PSK` 时，容器首次启动会自动生成密钥：
 ```bash
 docker run -d --name snell-server \
   --restart unless-stopped \
@@ -88,13 +61,119 @@ docker run -d --name snell-server \
   jinqians/snell-server:v5
 ```
 
-查看自动生成的密钥和配置：
+查看自动生成的 PSK：
+
 ```bash
-docker logs snell-server
 cat ./snell-config/snell-server.conf
 ```
 
-切换版本时同时修改镜像标签和 `SNELL_VER`：
+### 运行 Snell + ShadowTLS
+
+```bash
+docker run -d --name snell-shadowtls \
+  --restart unless-stopped \
+  -p 8443:8443/tcp \
+  -e SNELL_PORT=6160 \
+  -e SNELL_VER=v5 \
+  -e SNELL_LISTEN_HOST=127.0.0.1 \
+  -e SHADOWTLS_ENABLE=1 \
+  -e SHADOWTLS_PORT=8443 \
+  -e SHADOWTLS_SNI=www.microsoft.com \
+  -v ./snell-config:/etc/snell \
+  jinqians/snell-server:v5
+```
+
+启用 ShadowTLS 后，客户端连接 `8443`。Snell 后端只在容器内监听 `127.0.0.1:6160`，通常不需要映射 Snell 原始端口。
+
+查看客户端需要的密钥：
+
+```bash
+grep '^psk' ./snell-config/snell-server.conf
+cat ./snell-config/shadowtls-password
+```
+
+客户端填写：
+
+| 项目 | 填写内容 |
+|------|----------|
+| 服务器 | VPS 公网 IP 或域名 |
+| 端口 | ShadowTLS 对外端口，示例为 `8443` |
+| Snell 版本 | `5` |
+| Snell PSK | `./snell-config/snell-server.conf` 里的 `psk` |
+| ShadowTLS 密码 | `./snell-config/shadowtls-password` 的内容，或手动传入的 `SHADOWTLS_PASSWORD` |
+| ShadowTLS SNI | `SHADOWTLS_SNI`，默认 `www.microsoft.com` |
+| ShadowTLS 版本 | `3` |
+
+Surge 示例：
+
+```text
+HK = snell, 服务器IP, 8443, psk = your_16_plus_char_psk, version = 5, reuse = true, tfo = true, shadow-tls-password = your_shadowtls_password, shadow-tls-sni = www.microsoft.com, shadow-tls-version = 3
+```
+
+## Docker Compose
+
+### Snell + ShadowTLS
+
+创建 `compose.yml`：
+
+```yaml
+services:
+  snell-shadowtls:
+    image: jinqians/snell-server:v5
+    container_name: snell-shadowtls
+    restart: unless-stopped
+    ports:
+      - "8443:8443/tcp"
+    environment:
+      - SNELL_PORT=6160
+      - SNELL_VER=v5
+      - SNELL_LISTEN_HOST=127.0.0.1
+      - SHADOWTLS_ENABLE=1
+      - SHADOWTLS_PORT=8443
+      - SHADOWTLS_SNI=www.microsoft.com
+    volumes:
+      - ./snell-config:/etc/snell
+```
+
+启动：
+
+```bash
+docker compose up -d
+```
+
+查看配置：
+
+```bash
+docker logs snell-shadowtls
+cat ./snell-config/snell-server.conf
+cat ./snell-config/shadowtls-password
+```
+
+停止并删除：
+
+```bash
+docker compose down
+```
+
+## Docker 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `SNELL_VER` | `v4` | Snell 配置模式：`v4`、`v5`、`v6` |
+| `SNELL_PORT` | `6160` | Snell 后端监听端口 |
+| `SNELL_PSK` | 自动生成 | Snell PSK |
+| `SNELL_LISTEN_HOST` | `0.0.0.0` | Snell 监听地址；搭配 ShadowTLS 时使用 `127.0.0.1` |
+| `SNELL_IPV6` | `true` | v4 / v6 配置项 |
+| `SNELL_TFO` | `true` | v4 / v6 配置项 |
+| `SHADOWTLS_ENABLE` | `0` | 设置为 `1` 启用 ShadowTLS |
+| `SHADOWTLS_PORT` | `8443` | ShadowTLS 对外监听端口 |
+| `SHADOWTLS_PASSWORD` | 自动生成 | ShadowTLS 密码，会保存到 `/etc/snell/shadowtls-password` |
+| `SHADOWTLS_SNI` | `www.microsoft.com` | ShadowTLS TLS 伪装 SNI |
+
+## 切换 Docker 版本
+
+切换版本时同时修改镜像标签和 `SNELL_VER`。
+
 ```bash
 # v4
 docker run -d --name snell-server \
@@ -117,143 +196,41 @@ docker run -d --name snell-server \
   jinqians/snell-server:v6
 ```
 
-手动填写 `SNELL_PSK` 时建议使用 16 字符以上，兼容 v6。v5 和 v6 需要同时映射 TCP/UDP，v4 只使用 TCP 也可以，但保留 UDP 映射不影响使用。
+## 本地构建 Docker 镜像
 
-Snell + ShadowTLS 运行：
-```bash
-docker run -d --name snell-shadowtls \
-  --restart unless-stopped \
-  -p 8443:8443/tcp \
-  -e SNELL_PORT=6160 \
-  -e SNELL_VER=v5 \
-  -e SNELL_LISTEN_HOST=127.0.0.1 \
-  -e SNELL_PSK=your_16_plus_char_psk \
-  -e SHADOWTLS_ENABLE=1 \
-  -e SHADOWTLS_PORT=8443 \
-  -e SHADOWTLS_PASSWORD=your_shadowtls_password \
-  -e SHADOWTLS_SNI=www.microsoft.com \
-  -v ./snell-config:/etc/snell \
-  jinqians/snell-server:v5
-```
-
-不传入 `SHADOWTLS_PASSWORD` 时会自动生成，并保存到 `./snell-config/shadowtls-password`。启用 ShadowTLS 后，客户端连接 `8443`，Snell 后端端口 `6160` 只在容器内使用，通常不需要映射到宿主机。
-
-查看自动生成的 ShadowTLS 密码：
-```bash
-cat ./snell-config/shadowtls-password
-```
-
-客户端填写：
-
-| 项目 | 填写内容 |
-|------|----------|
-| 服务器 | VPS 公网 IP 或域名 |
-| 端口 | ShadowTLS 对外端口，示例为 `8443` |
-| Snell 版本 | `5` |
-| Snell PSK | `./snell-config/snell-server.conf` 里的 `psk` |
-| ShadowTLS 密码 | `./snell-config/shadowtls-password` 的内容，或手动传入的 `SHADOWTLS_PASSWORD` |
-| ShadowTLS SNI | `SHADOWTLS_SNI`，默认 `www.microsoft.com` |
-
-查看客户端需要的密钥：
-```bash
-grep '^psk' ./snell-config/snell-server.conf
-cat ./snell-config/shadowtls-password
-```
-
-Surge 示例：
-```text
-HK = snell, 服务器IP, 8443, psk = your_16_plus_char_psk, version = 5, reuse = true, tfo = true, shadow-tls-password = your_shadowtls_password, shadow-tls-sni = www.microsoft.com, shadow-tls-version = 3
-```
-
-升级镜像：
-```bash
-docker pull jinqians/snell-server:v5
-docker rm -f snell-server
-docker run -d --name snell-server \
-  --restart unless-stopped \
-  -p 6160:6160/tcp \
-  -p 6160:6160/udp \
-  -e SNELL_PORT=6160 \
-  -e SNELL_VER=v5 \
-  -v ./snell-config:/etc/snell \
-  jinqians/snell-server:v5
-```
-
-卸载容器：
-```bash
-docker rm -f snell-server
-```
-
-#### Docker Compose
-创建 `compose.yml`：
-```yaml
-services:
-  snell:
-    image: jinqians/snell-server:latest
-    container_name: snell-server
-    restart: unless-stopped
-    ports:
-      - "6160:6160/tcp"
-      - "6160:6160/udp"
-    environment:
-      - SNELL_PORT=6160
-      - SNELL_VER=v5
-    volumes:
-      - ./snell-config:/etc/snell
-```
-
-启动：
-```bash
-docker compose up -d
-```
-
-查看自动生成的密钥和服务日志：
-```bash
-docker logs snell-server
-cat ./snell-config/snell-server.conf
-```
-
-如需手动指定密钥，在 `environment` 中加入：
-```yaml
-      - SNELL_PSK=your_16_plus_char_psk
-```
-
-Docker Compose 运行 Snell + ShadowTLS：
-```yaml
-services:
-  snell-shadowtls:
-    image: jinqians/snell-server:v5
-    container_name: snell-shadowtls
-    restart: unless-stopped
-    ports:
-      - "8443:8443/tcp"
-    environment:
-      - SNELL_PORT=6160
-      - SNELL_VER=v5
-      - SNELL_LISTEN_HOST=127.0.0.1
-      - SNELL_PSK=your_16_plus_char_psk
-      - SHADOWTLS_ENABLE=1
-      - SHADOWTLS_PORT=8443
-      - SHADOWTLS_PASSWORD=your_shadowtls_password
-      - SHADOWTLS_SNI=www.microsoft.com
-    volumes:
-      - ./snell-config:/etc/snell
-```
-
-停止并删除：
-```bash
-docker compose down
-```
-
-本地批量构建 v4/v5/v6 镜像：
 ```bash
 ./build-docker-images.sh
 ```
 
 多架构构建并推送：
+
 ```bash
 USE_BUILDX=1 PUSH=1 ./build-docker-images.sh
 ```
+
+## 协议简介
+
+<details>
+   <summary>展开查看</summary>
+
+### Snell 协议
+
+Snell 协议是由 Surge 团队设计的一种轻量级、高效的加密代理协议，专注于提供安全、快速的网络传输服务。该协议通过简洁的设计和加密技术，满足用户对隐私保护和高性能传输的需求。
+
+### Snell v4 vs v5 对比
+
+| 特性 | Snell v4 | Snell v5 |
+|------|----------|----------|
+| 状态 | 稳定版 | 最新版 |
+| 安全性 | 支持 | 支持 |
+| QUIC Proxy | 不支持 | 支持 |
+| Dynamic Record Sizing | 不支持 | 支持 |
+| 出口控制 | 不支持 | 支持 |
+
+### ShadowTLS
+
+ShadowTLS 是一个轻量级的 TLS 伪装工具，可以模拟正常 HTTPS 流量，用于提升连接隐蔽性和稳定性。
+
 </details>
 
 ## 流量管理
