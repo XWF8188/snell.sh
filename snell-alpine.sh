@@ -41,6 +41,25 @@ check_system() {
         echo -e "${RED}错误: 此脚本仅适用于 Alpine Linux 系统${RESET}"
         exit 1
     fi
+
+    # Alpine 3.19+ 的 glibc 兼容方案失效，仅支持 3.18 及以下
+    alpine_version=$(cat /etc/alpine-release)
+    alpine_major=$(echo "$alpine_version" | cut -d. -f1)
+    alpine_minor=$(echo "$alpine_version" | cut -d. -f2)
+    if [ "$alpine_major" -gt 3 ] 2>/dev/null || { [ "$alpine_major" -eq 3 ] && [ "$alpine_minor" -ge 19 ]; } 2>/dev/null; then
+        echo -e "${RED}错误: 检测到 Alpine ${alpine_version}，本脚本仅支持 Alpine 3.18 及以下版本${RESET}"
+        echo -e "${YELLOW}Alpine 3.19+ 请使用 Docker 安装：${RESET}"
+        echo ""
+        echo -e "${CYAN}docker run -d --name snell-server \\
+  --restart unless-stopped \\
+  --network host \\
+  -e SNELL_PORT=6160 \\
+  -e SNELL_PSK=your_psk \\
+  -e SNELL_VER=v5 \\
+  jinqians/snell-server:latest${RESET}"
+        echo ""
+        exit 1
+    fi
 }
 
 # --- 核心安装逻辑 ---
